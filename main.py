@@ -1,6 +1,7 @@
 import math
 from dataclasses import dataclass
 
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -92,11 +93,57 @@ class GPT(nn.Module):
             )
         )
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
-
+        
+    def forward(self, idx):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
+        # forward the GPT model
+        pos = torch.arrange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos_emb = self.transformer.wpe(pos) # shape (T, n_embed)
+        tok_emb = self.transformer.wte(idx) # shape (B, T, n_embed)
+        x = tok_emb + pos_emb # broadcast to (B, T, n_embed)
+        # forward the transformer blocks
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layer norm and linear layer
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # shape (B, T, vocab_size)
+        return logits
 
 def main():
-    print("Hello from gpt2-from-scratch!")
-
+    num_return_sequences = 5
+    max_length = 30
+    
+    model = GPT(GPTConfig())
+    model.eval() # set to evaluation mode
+    
+    model.to("cuda")
+    
+    enc = tiktoken.get_encoding("gpt2")
+    prefix = "Hello, I'm a language model,"
+    tokens = enc.encode(prefix)
+    tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0) # shape (1, T)
+    x = tokens.to("cuda")
+    
+    # generate
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    while x.size(1) < max_length:
+        with torch.no_grad():
+            logits = model(x)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+            ix = torch.multinomial(topk_probs, 1)
+            xcol = torch.gather(topk_indices, -1, ix)
+            x = torch.cat((x, xcol), dim=1)
+            
+    for i in range(num_return_sequences):
+        print(f"Generated sequence {i+1}:")
+        tokens = x[i, :max_length].tolist()
+        decoded = enc.decode(tokens)
+        print(">", decoded)
 
 if __name__ == "__main__":
     main()
